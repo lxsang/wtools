@@ -28,6 +28,143 @@ iw_print_value_name(unsigned int value,
     printf(" %s", names[value]);
 }
 
+void
+iw_print_json_stats(char *		buffer,
+	       int		buflen,
+	       const iwqual *	qual,
+	       const iwrange *	range,
+	       int		has_range)
+{
+  int		len;
+
+  /* People are very often confused by the 8 bit arithmetic happening
+   * here.
+   * All the values here are encoded in a 8 bit integer. 8 bit integers
+   * are either unsigned [0 ; 255], signed [-128 ; +127] or
+   * negative [-255 ; 0].
+   * Further, on 8 bits, 0x100 == 256 == 0.
+   *
+   * Relative/percent values are always encoded unsigned, between 0 and 255.
+   * Absolute/dBm values are always encoded between -192 and 63.
+   * (Note that up to version 28 of Wireless Tools, dBm used to be
+   *  encoded always negative, between -256 and -1).
+   *
+   * How do we separate relative from absolute values ?
+   * The old way is to use the range to do that. As of WE-19, we have
+   * an explicit IW_QUAL_DBM flag in updated...
+   * The range allow to specify the real min/max of the value. As the
+   * range struct only specify one bound of the value, we assume that
+   * the other bound is 0 (zero).
+   * For relative values, range is [0 ; range->max].
+   * For absolute values, range is [range->max ; 63].
+   *
+   * Let's take two example :
+   * 1) value is 75%. qual->value = 75 ; range->max_qual.value = 100
+   * 2) value is -54dBm. noise floor of the radio is -104dBm.
+   *    qual->value = -54 = 202 ; range->max_qual.value = -104 = 152
+   *
+   * Jean II
+   */
+
+  /* Just do it...
+   * The old way to detect dBm require both the range and a non-null
+   * level (which confuse the test). The new way can deal with level of 0
+   * because it does an explicit test on the flag. */
+  if(has_range && ((qual->level != 0)
+		   || (qual->updated & (IW_QUAL_DBM | IW_QUAL_RCPI))))
+    {
+      /* Deal with quality : always a relative value */
+      if(!(qual->updated & IW_QUAL_QUAL_INVALID))
+	{
+	  len = snprintf(buffer, buflen, "\"quality\":%d,\n\"maxquality\":%d,\n",
+			 qual->qual, range->max_qual.qual);
+	  buffer += len;
+	  buflen -= len;
+	}
+
+      /* Check if the statistics are in RCPI (IEEE 802.11k) */
+      if(qual->updated & IW_QUAL_RCPI)
+	{
+	  /* Deal with signal level in RCPI */
+	  /* RCPI = int{(Power in dBm +110)*2} for 0dbm > Power > -110dBm */
+	  if(!(qual->updated & IW_QUAL_LEVEL_INVALID))
+	    {
+	      double	rcpilevel = (qual->level / 2.0) - 110.0;
+	      len = snprintf(buffer, buflen, "\"signald\":%g,\n",
+			     rcpilevel);
+	      buffer += len;
+	      buflen -= len;
+	    }
+
+	  /* Deal with noise level in dBm (absolute power measurement) */
+	  if(!(qual->updated & IW_QUAL_NOISE_INVALID))
+	    {
+	      double	rcpinoise = (qual->noise / 2.0) - 110.0;
+	      len = snprintf(buffer, buflen, "\"noised\":%g",
+			     rcpinoise);
+	    }
+	}
+      else
+	{
+	  /* Check if the statistics are in dBm */
+	  if((qual->updated & IW_QUAL_DBM)
+	     || (qual->level > range->max_qual.level))
+	    {
+	      /* Deal with signal level in dBm  (absolute power measurement) */
+	      if(!(qual->updated & IW_QUAL_LEVEL_INVALID))
+		{
+		  int	dblevel = qual->level;
+		  /* Implement a range for dBm [-192; 63] */
+		  if(qual->level >= 64)
+		    dblevel -= 0x100;
+		  len = snprintf(buffer, buflen, "\"signald\":%d,\n",
+				 dblevel);
+		  buffer += len;
+		  buflen -= len;
+		}
+
+	      /* Deal with noise level in dBm (absolute power measurement) */
+	      if(!(qual->updated & IW_QUAL_NOISE_INVALID))
+		{
+		  int	dbnoise = qual->noise;
+		  /* Implement a range for dBm [-192; 63] */
+		  if(qual->noise >= 64)
+		    dbnoise -= 0x100;
+		  len = snprintf(buffer, buflen, "\"noised\":%d",
+				 dbnoise);
+		}
+	    }
+	  else
+	    {
+	      /* Deal with signal level as relative value (0 -> max) */
+	      if(!(qual->updated & IW_QUAL_LEVEL_INVALID))
+		{
+		  len = snprintf(buffer, buflen, "\"signal\":%d,\n\"maxsignal\":%d,\n",
+	
+				 qual->level, range->max_qual.level);
+		  buffer += len;
+		  buflen -= len;
+		}
+
+	      /* Deal with noise level as relative value (0 -> max) */
+	      if(!(qual->updated & IW_QUAL_NOISE_INVALID))
+		{
+		  len = snprintf(buffer, buflen, "\"noise\":%d,\n\"maxnoise\":%d,\n",
+				 qual->noise, range->max_qual.noise);
+		}
+	    }
+	}
+    }
+  else
+    {
+      /* We can't read the range, so we don't know... */
+      /*snprintf(buffer, buflen,
+	       "Quality:%d  Signal level:%d  Noise level:%d",
+	       qual->qual, qual->level, qual->noise);*/
+    }
+}
+
+
 
 /***************************** SCANNING *****************************/
 /*
@@ -52,12 +189,11 @@ print_scanning_token(struct stream_descr *stream, /* Stream of events */
                      int has_range)
 {
   char buffer[128]; /* Temporary buffer */
-
   /* Now, let's decode the event */
   switch (event->cmd)
   {
   case SIOCGIWAP:
-    printf("          Cell %02d - Address: %s\n", state->ap_num,
+    printf("{\n\"cell\":%02d,\n\"address\": \"%s\",\n", state->ap_num,
            iw_saether_ntop(&event->u.ap_addr, buffer));
     state->ap_num++;
     break;
@@ -75,21 +211,26 @@ print_scanning_token(struct stream_descr *stream, /* Stream of events */
     /* Convert to channel if possible */
     if (has_range)
       channel = iw_freq_to_channel(freq, iw_range);
-    iw_print_freq(buffer, sizeof(buffer),
-                  freq, channel, event->u.freq.flags);
-    printf("                    %s\n", buffer);
+    if(channel != -1)
+    {
+      printf("\"channel\":%d,\n", channel);
+      printf("\"frequency\": %lf,\n", freq);
+    }
+    //iw_print_freq(buffer, sizeof(buffer),
+    //              freq, channel, event->u.freq.flags);
+    //printf("                    %s\n", buffer);
   }
   break;
   case SIOCGIWMODE:
     /* Note : event->u.mode is unsigned, no need to check <= 0 */
     if (event->u.mode >= IW_NUM_OPER_MODE)
       event->u.mode = IW_NUM_OPER_MODE;
-    printf("                    Mode:%s\n",
-           iw_operation_mode[event->u.mode]);
+    printf("\"mode\":%d,\n\"modename\":\"%s\",\n}\n",
+           event->u.mode, iw_operation_mode[event->u.mode]);
     break;
-  case SIOCGIWNAME:
+  /*case SIOCGIWNAME:
     printf("                    Protocol:%-1.16s\n", event->u.name);
-    break;
+    break;*/
   case SIOCGIWESSID:
   {
     char essid[IW_ESSID_MAX_SIZE + 1];
@@ -100,17 +241,17 @@ print_scanning_token(struct stream_descr *stream, /* Stream of events */
     {
       /* Does it have an ESSID index ? */
       if ((event->u.essid.flags & IW_ENCODE_INDEX) > 1)
-        printf("                    ESSID:\"%s\" [%d]\n", essid,
+        printf("\"ESSID\":\"'%s' [%d]\",\n", essid,
                (event->u.essid.flags & IW_ENCODE_INDEX));
       else
-        printf("                    ESSID:\"%s\"\n", essid);
+        printf("\"ESSID\":\"%s\",\n", essid);
     }
     else
-      printf("                    ESSID:off/any/hidden\n");
+      printf("\"ESSID\":\"off/any/hidden\",\n");
   }
   break;
   
-  case SIOCGIWRATE:
+  /*case SIOCGIWRATE:
     if (state->val_index == 0)
       printf("                    Bit Rates:");
     else if ((state->val_index % 5) == 0)
@@ -119,7 +260,6 @@ print_scanning_token(struct stream_descr *stream, /* Stream of events */
       printf("; ");
     iw_print_bitrate(buffer, sizeof(buffer), event->u.bitrate.value);
     printf("%s", buffer);
-    /* Check for termination */
     if (stream->value == NULL)
     {
       printf("\n");
@@ -128,10 +268,11 @@ print_scanning_token(struct stream_descr *stream, /* Stream of events */
     else
       state->val_index++;
     break;
+  */
   case IWEVQUAL:
-    iw_print_stats(buffer, sizeof(buffer),
+    iw_print_json_stats(buffer, sizeof(buffer),
                    &event->u.qual, iw_range, has_range);
-    printf("                    %s\n", buffer);
+    printf("%s\n", buffer);
     break;
   /*case IWEVCUSTOM:
   {
@@ -303,7 +444,7 @@ print_scanning_info(int skfd,
     /* In here, check if event and event type
        * if scan event, read results. All errors bad & no reset timeout */
   }
-
+ 
   if (wrq.u.data.length)
   {
     struct iw_event iwe;
@@ -311,7 +452,7 @@ print_scanning_info(int skfd,
     struct iwscan_state state = {.ap_num = 1, .val_index = 0};
     int ret;
 
-    printf("%-8.16s  Scan completed :\n", ifname);
+    //printf("%-8.16s  Scan completed :\n", ifname);
     iw_init_event_stream(&stream, (char *)buffer, wrq.u.data.length);
     do
     {
@@ -319,14 +460,16 @@ print_scanning_info(int skfd,
       ret = iw_extract_event_stream(&stream, &iwe,
                                     range.we_version_compiled);
       if (ret > 0)
-        print_scanning_token(&stream, &iwe, &state,
+        {
+          //printf("%s\n",",{");
+          print_scanning_token(&stream, &iwe, &state,
                              &range, has_range);
+           //printf("%s\n","}");
+        }
     } while (ret > 0);
-    printf("\n");
   }
   else
-    printf("%-8.16s  No scan results\n\n", ifname);
-
+    printf("{\"error\": \"%-8.16s  No scan results\"}\n", ifname);
   free(buffer);
   return (0);
 }
@@ -349,7 +492,7 @@ int main(int argc,
     return -1;
   }
 
-  print_scanning_info(skfd, "wlo1", NULL, 0);
+  print_scanning_info(skfd, "wlx6470021ccb6a", NULL, 0);
 
   /* Close the socket. */
   iw_sockets_close(skfd);
